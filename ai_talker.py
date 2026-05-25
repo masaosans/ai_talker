@@ -142,6 +142,7 @@ REFERENCE_TEXT = ""
 
 VOICE_PROMPT = None
 
+global IS_AI_SPERKING
 IS_AI_SPERKING = False
 
 os.makedirs(VOICE_DIR, exist_ok=True)
@@ -179,7 +180,8 @@ print("================================================\n")
 interrupt_event = asyncio.Event()
 
 audio_task = None
-#queを行う形に修正
+
+# queを行う形に修正
 tts_text_queue = asyncio.Queue()
 audio_queue = asyncio.Queue()
 
@@ -188,15 +190,35 @@ playback_worker_task = None
 
 REFERENCE_AUDIO = None
 
+# ============================================================
+# AUDIO BUFFER SYSTEM
+# ============================================================
+
+# 音声を細切れで即再生すると gap が出る
+# 一旦 buffer に貯めてから連続再生する
+
+AUDIO_BUFFER_CHUNKS = 2 # 6だと遅すぎる
+
+# 再生中フラグ
+IS_AI_SPERKING = False
+
+# 最後にAIが喋った時刻
+LAST_AI_SPEAK_TIME = 0.0
+
 conversation_history = [
     {
         "role": "system",
         "content": """
-あなたはリアルタイム音声AIです。
+あなたは優しい男性です。
 
+ルール:
 - 短く自然に返答
 - 会話テンポ優先
 - 長文禁止
+- 内部思考を出力しない
+- thinkタグを出力しない
+- reasoningしない
+- 即答する
 """
     }
 ]
@@ -461,6 +483,7 @@ llm = Llama(
     use_mlock=False,
     verbose=False,
     chat_format="chatml"
+    
 )
 
 print("LLM OK")
@@ -478,7 +501,8 @@ gc.collect()
 tts_model = Qwen3TTSModel.from_pretrained(
     TTS_MODEL,
     device_map="cuda:0",
-    dtype=torch.float32,
+    dtype=torch.bfloat16,
+    attn_implementation="sdpa",
 )
 
 # 推論モード
@@ -630,7 +654,7 @@ async def token_chunker(token_stream):
         current += token
 
         if (
-            len(current) >= 12
+            len(current) >= 4
             or any(current.endswith(p) for p in punctuation)
         ):
 
@@ -648,6 +672,8 @@ async def token_chunker(token_stream):
 async def streaming_tts(text):
 
     try:
+
+        global LAST_AI_SPEAK_TIME
 
         # ============================================
         # THINK TOKEN REMOVE
@@ -668,6 +694,11 @@ async def streaming_tts(text):
         if not text:
             return
 
+        print("\n[TTS START]")
+        print(text)
+
+        t0 = time.perf_counter()
+
         # ============================================
         # 音声クローン
         # ============================================
@@ -676,11 +707,12 @@ async def streaming_tts(text):
             text=text,
             language="Japanese",
             voice_clone_prompt=VOICE_PROMPT,
-            #non_streaming_mode=True,
         )
 
-        print("\n[TTS RAW TYPE]")
-        print(type(result))
+        print(
+            f"[TTS GEN TIME] "
+            f"{time.perf_counter() - t0:.2f}s"
+        )
 
         # ====================================================
         # various return formats
@@ -750,8 +782,6 @@ async def streaming_tts(text):
 
         peak = np.max(np.abs(audio_np))
 
-        print("peak:", peak)
-
         if peak > 0:
 
             audio_np = audio_np / peak
@@ -765,11 +795,18 @@ async def streaming_tts(text):
         )
 
         # ====================================================
-        # streaming
+        # SPEAKING FLAG
         # ====================================================
 
-        #chunk_size = 8192
-        chunk_size = 2048
+        LAST_AI_SPEAK_TIME = time.time()
+
+        # ====================================================
+        # BUFFERED STREAMING
+        # ====================================================
+
+        chunk_size = 1024
+
+        chunks = []
 
         for i in range(
             0,
@@ -782,15 +819,33 @@ async def streaming_tts(text):
                 print("\n[TTS INTERRUPTED]")
                 return
 
-            #yield audio_np[
-            #    i:i + chunk_size
-            #]
-            # yieldしない
-            await audio_queue.put(
-               audio_np[i:i + chunk_size]
-)
+            chunk = audio_np[
+                i:i + chunk_size
+            ]
 
-            await asyncio.sleep(0)
+            chunks.append(chunk)
+
+            # ============================================
+            # 最初に少し貯めてから再生
+            # ============================================
+
+            if len(chunks) >= AUDIO_BUFFER_CHUNKS:
+
+                merged = np.concatenate(chunks)
+
+                await audio_queue.put(merged)
+
+                chunks = []
+
+        # ============================================
+        # 残り flush
+        # ============================================
+
+        if chunks:
+
+            merged = np.concatenate(chunks)
+
+            await audio_queue.put(merged)
 
     except Exception as e:
 
@@ -829,15 +884,19 @@ async def tts_worker():
 
 async def audio_playback_worker():
 
+    global IS_AI_SPERKING
+    global LAST_AI_SPEAK_TIME
+
     stream = sd.OutputStream(
         samplerate=24000,
         channels=1,
         dtype="float32",
-        blocksize=0,
-        latency="low",
-        #AIの修正案（低地円すぎるとぶちぶちする？）
-        #blocksize=2048,
-        #latency=0.05,
+
+        # 安定重視
+        blocksize=1024,
+
+        # low より固定値の方が安定する
+        latency=0.03,
     )
 
     stream.start()
@@ -853,11 +912,15 @@ async def audio_playback_worker():
             if chunk is None:
                 break
 
-            #発話中フラグ
-            IS_AI_SPERKING = True
-
             if interrupt_event.is_set():
                 continue
+
+            # ====================================================
+            # AI speaking ON
+            # ====================================================
+
+            IS_AI_SPERKING = True
+            LAST_AI_SPEAK_TIME = time.time()
 
             chunk = np.asarray(
                 chunk,
@@ -866,10 +929,28 @@ async def audio_playback_worker():
 
             chunk = chunk.reshape(-1, 1)
 
+            t0 = time.perf_counter()
+
             stream.write(chunk)
 
-            #発話終了
-            IS_AI_SPERKING = False
+            print(
+                f"[PLAYBACK] "
+                f"{len(chunk)} samples / "
+                f"{time.perf_counter()-t0:.3f}s"
+            )
+
+            # ====================================================
+            # queue が空なら終了判定
+            # ====================================================
+
+            if audio_queue.empty():
+
+                # 少し待つ
+                await asyncio.sleep(0.02)
+
+                if audio_queue.empty():
+
+                    IS_AI_SPERKING = False
 
     except Exception as e:
 
@@ -888,6 +969,7 @@ async def audio_playback_worker():
 async def realtime_pipeline(audio):
 
     global audio_task
+    global LAST_AI_SPEAK_TIME
 
     interrupt_event.clear()
 
@@ -923,24 +1005,34 @@ async def realtime_pipeline(audio):
 
         audio_np = audio_np.astype(np.float32)
 
-    print("min:", audio_np.min())
-    print("max:", audio_np.max())
+    # ========================================================
+    # AI SPEAKING FILTER
+    # ========================================================
+
+    # AI発話直後のマイク入力は捨てる
+    # 自分の声ループ防止
+
+    since_ai = time.time() - LAST_AI_SPEAK_TIME
+
+    if since_ai < 0.8:
+
+        print(
+            f"\n[SKIP AI VOICE] "
+            f"{since_ai:.2f}s"
+        )
+
+        return
 
     # ========================================================
     # silence check
     # ========================================================
 
-    #マイク入力の大きさを基準に
     peak = np.max(np.abs(audio_np))
 
-    threshold = 0.9
-
-    if IS_AI_SPERKING:
-        threshold = 9.0   # ★10倍にする
+    threshold = 0.015
 
     print("peak:", peak)
     print("threshold:", threshold)
-
 
     if peak < threshold:
 
@@ -989,12 +1081,34 @@ async def realtime_pipeline(audio):
         await tts_text_queue.put(partial)
 
 # ============================================================
+# AUDIO QUEUE CLEAR
+# ============================================================
+
+async def clear_audio_queue():
+
+    while not audio_queue.empty():
+
+        try:
+            audio_queue.get_nowait()
+
+        except:
+            break
+
+# ============================================================
 # CALLBACK
 # ============================================================
 
 def response(audio):
 
     try:
+
+        # 割り込み時は queue を捨てる
+        if interrupt_event.is_set():
+
+            asyncio.run_coroutine_threadsafe(
+                clear_audio_queue(),
+                loop
+            )
 
         future = asyncio.run_coroutine_threadsafe(
             realtime_pipeline(audio),
@@ -1014,6 +1128,7 @@ def response(audio):
     )
 
     yield (24000, silence)
+
 
 # ============================================================
 # FASTRTC
