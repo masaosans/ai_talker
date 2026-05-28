@@ -183,12 +183,29 @@ audio_task = None
 
 # queを行う形に修正
 tts_text_queue = asyncio.Queue()
-audio_queue = asyncio.Queue()
+#方式変更
+#audio_queue = asyncio.Queue()
 
 tts_worker_task = None
 playback_worker_task = None
 
 REFERENCE_AUDIO = None
+
+# ============================================================
+# RING BUFFER
+# ============================================================
+
+RING_BUFFER_SIZE = 24000 * 20
+
+audio_ring = np.zeros(
+    RING_BUFFER_SIZE,
+    dtype=np.float32
+)
+
+ring_write_pos = 0
+ring_read_pos = 0
+
+ring_lock = threading.Lock()
 
 # ============================================================
 # AUDIO BUFFER SYSTEM
@@ -407,9 +424,7 @@ Voice Clone設定
 
     selected = str(voices[idx])
 
-    REFERENCE_AUDIO = preprocess_reference_audio(
-        selected
-    )
+    REFERENCE_AUDIO = selected
 
     print(f"\n選択: {REFERENCE_AUDIO}\n")
 
@@ -602,6 +617,7 @@ async def stream_llm(user_text):
     )
 
     full_text = ""
+    thinking = False
 
     for chunk in stream:
 
@@ -615,12 +631,31 @@ async def stream_llm(user_text):
                 ""
             )
 
+            if not token:
+                continue
 
-            if token:
+            # =========================
+            # THINK FILTER
+            # =========================
 
-                full_text += token
+            if "<think>" in token:
+                thinking = True
+                continue
 
-                yield token
+            if "</think>" in token:
+                thinking = False
+                continue
+
+            if thinking:
+                continue
+
+            # special token
+            if "<|" in token:
+                continue
+
+            full_text += token
+
+            yield token
 
         except:
             pass
@@ -638,32 +673,31 @@ async def token_chunker(token_stream):
 
     current = ""
 
-    punctuation = [
-        "。",
-        "！",
-        "？",
-        ".",
-        "!",
-        "?",
-        "、",
-        ","
-    ]
-
     async for token in token_stream:
 
         current += token
 
-        if (
-            len(current) >= 4
-            or any(current.endswith(p) for p in punctuation)
+        # 文末で切る
+        if any(
+            current.endswith(p)
+            #for p in "。、！？.!?\n"
+            for p in "。！？.!?\n"
         ):
 
-            yield current
+            yield current.strip()
 
             current = ""
 
-    if current:
-        yield current
+        # 長すぎ防止
+        elif len(current) >= 48:
+
+            yield current.strip()
+
+            current = ""
+
+    if current.strip():
+
+        yield current.strip()
 
 # ============================================================
 # STREAMING TTS
@@ -700,10 +734,10 @@ async def streaming_tts(text):
         t0 = time.perf_counter()
 
         # ============================================
-        # 音声クローン
+        # 音声クローン（別スレッド実行）
         # ============================================
-
-        result = tts_model.generate_voice_clone(
+        result = await asyncio.to_thread(
+            tts_model.generate_voice_clone,
             text=text,
             language="Japanese",
             voice_clone_prompt=VOICE_PROMPT,
@@ -801,51 +835,24 @@ async def streaming_tts(text):
         LAST_AI_SPEAK_TIME = time.time()
 
         # ====================================================
-        # BUFFERED STREAMING
+        # INTERRUPT CHECK
         # ====================================================
 
-        chunk_size = 1024
+        if interrupt_event.is_set():
 
-        chunks = []
+            print("\n[TTS INTERRUPTED]")
+            return
 
-        for i in range(
-            0,
-            len(audio_np),
-            chunk_size
-        ):
+        # ====================================================
+        # RING BUFFER WRITE
+        # ====================================================
 
-            if interrupt_event.is_set():
+        ring_write(audio_np)
 
-                print("\n[TTS INTERRUPTED]")
-                return
-
-            chunk = audio_np[
-                i:i + chunk_size
-            ]
-
-            chunks.append(chunk)
-
-            # ============================================
-            # 最初に少し貯めてから再生
-            # ============================================
-
-            if len(chunks) >= AUDIO_BUFFER_CHUNKS:
-
-                merged = np.concatenate(chunks)
-
-                await audio_queue.put(merged)
-
-                chunks = []
-
-        # ============================================
-        # 残り flush
-        # ============================================
-
-        if chunks:
-
-            merged = np.concatenate(chunks)
-
-            await audio_queue.put(merged)
+        print(
+            f"[RING WRITE] "
+            f"{len(audio_np)} samples"
+        )
 
     except Exception as e:
 
@@ -878,89 +885,7 @@ async def tts_worker():
             print(e)
 
 
-# ============================================================
-# AUDIO PLAYBACK WORKER
-# ============================================================
 
-async def audio_playback_worker():
-
-    global IS_AI_SPERKING
-    global LAST_AI_SPEAK_TIME
-
-    stream = sd.OutputStream(
-        samplerate=24000,
-        channels=1,
-        dtype="float32",
-
-        # 安定重視
-        blocksize=1024,
-
-        # low より固定値の方が安定する
-        latency=0.03,
-    )
-
-    stream.start()
-
-    print("\n[AUDIO WORKER STARTED]\n")
-
-    try:
-
-        while True:
-
-            chunk = await audio_queue.get()
-
-            if chunk is None:
-                break
-
-            if interrupt_event.is_set():
-                continue
-
-            # ====================================================
-            # AI speaking ON
-            # ====================================================
-
-            IS_AI_SPERKING = True
-            LAST_AI_SPEAK_TIME = time.time()
-
-            chunk = np.asarray(
-                chunk,
-                dtype=np.float32
-            )
-
-            chunk = chunk.reshape(-1, 1)
-
-            t0 = time.perf_counter()
-
-            stream.write(chunk)
-
-            print(
-                f"[PLAYBACK] "
-                f"{len(chunk)} samples / "
-                f"{time.perf_counter()-t0:.3f}s"
-            )
-
-            # ====================================================
-            # queue が空なら終了判定
-            # ====================================================
-
-            if audio_queue.empty():
-
-                # 少し待つ
-                await asyncio.sleep(0.02)
-
-                if audio_queue.empty():
-
-                    IS_AI_SPERKING = False
-
-    except Exception as e:
-
-        print("\n[PLAYBACK ERROR]")
-        print(e)
-
-    finally:
-
-        stream.stop()
-        stream.close()
 
 # ============================================================
 # PIPELINE
@@ -1080,19 +1005,173 @@ async def realtime_pipeline(audio):
 
         await tts_text_queue.put(partial)
 
+
+# ============================================================
+# audio callback
+# ============================================================
+
+def audio_callback(
+    outdata,
+    frames,
+    time_info,
+    status
+):
+
+    global ring_read_pos
+
+    out = np.zeros(
+        frames,
+        dtype=np.float32
+    )
+
+    with ring_lock:
+
+        available = (
+            ring_write_pos
+            - ring_read_pos
+        ) % RING_BUFFER_SIZE
+
+        # データなし
+        if available == 0:
+
+            outdata[:] = 0
+            return
+
+        read_frames = min(
+            frames,
+            available
+        )
+
+        end = ring_read_pos + read_frames
+
+        # wrapなし
+        if end < RING_BUFFER_SIZE:
+
+            out[:read_frames] = (
+                audio_ring[
+                    ring_read_pos:end
+                ]
+            )
+
+        # wrapあり
+        else:
+
+            first = (
+                RING_BUFFER_SIZE
+                - ring_read_pos
+            )
+
+            out[:first] = (
+                audio_ring[
+                    ring_read_pos:
+                ]
+            )
+
+            out[first:read_frames] = (
+                audio_ring[
+                    :read_frames-first
+                ]
+            )
+
+        ring_read_pos = (
+            ring_read_pos + read_frames
+        ) % RING_BUFFER_SIZE
+
+    outdata[:] = out.reshape(-1, 1)
+
+    print(
+        f"[PLAYBACK] "
+        f"{read_frames} samples"
+    )
+
+# ============================================================
+# ring write
+# ============================================================
+
+def ring_write(audio):
+
+    global ring_write_pos
+
+    audio = np.asarray(
+        audio,
+        dtype=np.float32
+    ).reshape(-1)
+
+    n = len(audio)
+
+    with ring_lock:
+
+        end = ring_write_pos + n
+
+        # wrapなし
+        if end < RING_BUFFER_SIZE:
+
+            audio_ring[
+                ring_write_pos:end
+            ] = audio
+
+        # wrapあり
+        else:
+
+            first = (
+                RING_BUFFER_SIZE
+                - ring_write_pos
+            )
+
+            audio_ring[
+                ring_write_pos:
+            ] = audio[:first]
+
+            audio_ring[
+                :n-first
+            ] = audio[first:]
+
+        ring_write_pos = (
+            ring_write_pos + n
+        ) % RING_BUFFER_SIZE
+
+# ============================================================
+# init audio output
+# ============================================================
+
+def init_audio_output():
+
+    global play_stream
+
+    play_stream = sd.OutputStream(
+        samplerate=24000,
+        channels=1,
+        dtype="float32",
+
+        # QwenTTS向け
+        blocksize=2048,
+
+        latency=0.05,
+
+        callback=audio_callback,
+    )
+
+    play_stream.start()
+
+    print("\n[AUDIO CALLBACK STARTED]\n")
+
 # ============================================================
 # AUDIO QUEUE CLEAR
 # ============================================================
 
 async def clear_audio_queue():
 
-    while not audio_queue.empty():
+    global ring_read_pos
+    global ring_write_pos
 
-        try:
-            audio_queue.get_nowait()
+    with ring_lock:
 
-        except:
-            break
+        ring_read_pos = 0
+        ring_write_pos = 0
+
+        audio_ring.fill(0)
+
+    print("\n[RING BUFFER CLEARED]\n")
 
 # ============================================================
 # CALLBACK
@@ -1110,12 +1189,13 @@ def response(audio):
                 loop
             )
 
-        future = asyncio.run_coroutine_threadsafe(
+        #future = asyncio.run_coroutine_threadsafe(
+        asyncio.run_coroutine_threadsafe(
             realtime_pipeline(audio),
             loop
         )
 
-        future.result()
+        #future.result()
 
     except Exception as e:
 
@@ -1157,11 +1237,11 @@ def loop_runner():
         tts_worker()
     )
 
-    loop.create_task(
-        audio_playback_worker()
-    )
 
     loop.run_forever()
+
+# audio outputの初期化
+init_audio_output()
 
 threading.Thread(
     target=loop_runner,
