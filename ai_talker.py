@@ -25,6 +25,7 @@ pip install
 ====================================================================
 
 # CUDA 12.4
+pip uninstall torch torchvision torchaudio
 pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
 
 # Transformers
@@ -112,7 +113,8 @@ from faster_whisper import WhisperModel
 
 from llama_cpp import Llama
 
-from qwen_tts import Qwen3TTSModel
+#from qwen_tts import Qwen3TTSModel
+from faster_qwen3_tts import FasterQwen3TTS
 
 from fastrtc import (
     Stream,
@@ -513,19 +515,14 @@ print("Loading Qwen3-TTS...")
 torch.cuda.empty_cache()
 gc.collect()
 
-tts_model = Qwen3TTSModel.from_pretrained(
+tts_model = FasterQwen3TTS.from_pretrained(
     TTS_MODEL,
-    device_map="cuda:0",
-    dtype=torch.bfloat16,
-    attn_implementation="sdpa",
 )
+#    device_map="cuda:0",
+#    dtype=torch.bfloat16,
+#    attn_implementation="sdpa",
 
-# 推論モード
-tts_model.model.eval()
 
-# gradient無効
-for p in tts_model.model.parameters():
-    p.requires_grad = False
 
 print("TTS OK")
 
@@ -539,12 +536,22 @@ REFERENCE_TEXT = generate_reference_text(REFERENCE_AUDIO)
 print("REFERENCE_TEXT OK")
 
 #プロンプトも生成
-VOICE_PROMPT = tts_model.create_voice_clone_prompt(
+VOICE_PROMPT = tts_model.model.create_voice_clone_prompt(
     ref_audio=REFERENCE_AUDIO,
     ref_text=REFERENCE_TEXT,
+    x_vector_only_mode=True,
 )
 print("VOICE_PROMPT OK")
 
+print("TEST RUN")
+
+# 2回目以降の高速化
+boo = tts_model.generate_voice_clone(
+    text="REFERENCE_TEXT",
+    language="Japanese",
+    voice_clone_prompt=VOICE_PROMPT,
+)
+print("TEST RUN OK")
 
 # ============================================================
 # DEBUG
@@ -736,6 +743,7 @@ async def streaming_tts(text):
         # ============================================
         # 音声クローン（別スレッド実行）
         # ============================================
+        #audio_list, sr  = 
         result = await asyncio.to_thread(
             tts_model.generate_voice_clone,
             text=text,
@@ -883,9 +891,6 @@ async def tts_worker():
 
             print("\n[TTS WORKER ERROR]")
             print(e)
-
-
-
 
 # ============================================================
 # PIPELINE
