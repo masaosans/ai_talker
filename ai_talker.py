@@ -36,7 +36,7 @@ pip install accelerate
 pip install sentencepiece
 
 # Qwen3-TTS
-pip install qwen-tts
+pip install faster-qwen3-tts
 
 # FastRTC
 pip install "fastrtc[vad]"
