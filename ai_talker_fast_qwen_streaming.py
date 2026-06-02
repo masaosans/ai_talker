@@ -27,6 +27,7 @@ pip install
 # CUDA 12.4
 pip uninstall torch torchvision torchaudio
 pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+#pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/xpu
 
 # Transformers
 pip install transformers==4.57.3
@@ -36,7 +37,9 @@ pip install accelerate
 pip install sentencepiece
 
 # Qwen3-TTS
-pip install qwen-tts
+#pip install qwen-tts
+pip install faster-qwen3-tts
+
 
 # FastRTC
 pip install "fastrtc[vad]"
