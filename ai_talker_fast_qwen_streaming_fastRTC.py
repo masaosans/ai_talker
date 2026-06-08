@@ -27,7 +27,6 @@ pip install
 # CUDA 12.4
 pip uninstall torch torchvision torchaudio
 pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
-#pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/xpu
 
 # Transformers
 pip install transformers==4.57.3
@@ -40,7 +39,6 @@ pip install sentencepiece
 #pip install qwen-tts
 pip install faster-qwen3-tts
 
-
 # FastRTC
 pip install "fastrtc[vad]"
 
@@ -48,7 +46,7 @@ pip install "fastrtc[vad]"
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 
 # audio
-pip install numpy librosa soundfile sounddevice
+pip install numpy librosa soundfile #sounddevice
 
 # ASR
 pip install faster-whisper
@@ -108,7 +106,7 @@ os.environ["PATH"] += r";C:\lib\sox"
 import numpy as np
 import librosa
 import soundfile as sf
-import queue
+#import sounddevice as sd
 
 import torch
 
@@ -128,17 +126,13 @@ import re
 import gc
 import threading
 
-from huggingface_hub import hf_hub_download
-
 # ============================================================
 # CONFIG
 # ============================================================
-# dir用意
+
 VOICE_DIR = "./voices"
 
-# HuggingFaceから自動DL
-LLM_REPO      = "unsloth/Qwen3.5-2B-GGUF"
-LLM_GGUF_FILE = "Qwen3.5-2B-IQ4_XS.gguf"
+LLM_GGUF = "./models/Qwen3.5-2B-IQ4_XS.gguf"
 
 WHISPER_MODEL = "large-v3-turbo"
 
@@ -150,6 +144,9 @@ N_CTX = 4096
 REFERENCE_TEXT = ""
 
 VOICE_PROMPT = None
+
+global IS_AI_SPERKING
+IS_AI_SPERKING = False
 
 os.makedirs(VOICE_DIR, exist_ok=True)
 
@@ -195,19 +192,35 @@ tts_text_queue = asyncio.Queue()
 tts_worker_task = None
 playback_worker_task = None
 
-# TTS モデルへの同時アクセスを防ぐ Lock
-tts_lock = threading.Lock()
-
 REFERENCE_AUDIO = None
 
 # ============================================================
-# AUDIO OUT (FastRTC経由でブラウザへ)
+# RING BUFFER
 # ============================================================
 
-# TTSチャンクを FastRTCの response() へ橋渡しするキュー
-audio_out_queue = queue.Queue()
-# ターン終了センチネル (tts_text_queue用)
-TURN_END = object()
+RING_BUFFER_SIZE = 24000 * 20
+
+audio_ring = np.zeros(
+    RING_BUFFER_SIZE,
+    dtype=np.float32
+)
+
+ring_write_pos = 0
+ring_read_pos = 0
+
+ring_lock = threading.Lock()
+
+# ============================================================
+# AUDIO BUFFER SYSTEM
+# ============================================================
+
+# 音声を細切れで即再生すると gap が出る
+# 一旦 buffer に貯めてから連続再生する
+
+AUDIO_BUFFER_CHUNKS = 2 # 6だと遅すぎる
+
+# 再生中フラグ
+IS_AI_SPERKING = False
 
 # 最後にAIが喋った時刻
 LAST_AI_SPEAK_TIME = 0.0
@@ -216,16 +229,14 @@ conversation_history = [
     {
         "role": "system",
         "content": """
-あなたは優しい男性です。
+あなたは対話型AIです。
+楽しく会話を行うことが目的です。
 
 ルール:
-- 短く自然に返答
 - 会話テンポ優先
-- 長文禁止
+- 入力メッセージが今までの会話とかみ合わなければ聞き間違いを疑う
 - 内部思考を出力しない
 - thinkタグを出力しない
-- reasoningしない
-- 即答する
 """
     }
 ]
@@ -432,8 +443,8 @@ print("Loading faster-whisper...")
 
 asr_model = WhisperModel(
     WHISPER_MODEL,
-    device="cpu",
-    compute_type="int8",
+    device="cuda",
+    compute_type="float16",
     cpu_threads=4,
     num_workers=1,
 )
@@ -470,13 +481,14 @@ def generate_reference_text(audio_path: str) -> str:
 # LOAD LLM
 # ============================================================
 
-print("Downloading/Loading Qwen GGUF from HuggingFace...")
+print("Loading Qwen GGUF...")
 
-LLM_GGUF = hf_hub_download(
-    repo_id=LLM_REPO,
-    filename=LLM_GGUF_FILE,
-)
-print("download complete")
+if not os.path.exists(LLM_GGUF):
+
+    raise FileNotFoundError(
+        f"GGUF not found:\n{LLM_GGUF}"
+    )
+
 llm = Llama(
     model_path=LLM_GGUF,
     n_gpu_layers=-1,
@@ -487,6 +499,7 @@ llm = Llama(
     use_mlock=False,
     verbose=False,
     chat_format="chatml"
+    
 )
 
 print("LLM OK")
@@ -714,49 +727,81 @@ async def streaming_tts(text):
 
         t0 = time.perf_counter()
 
-        # 割り込み済みなら即スキップ
-        if interrupt_event.is_set():
-            print("[TTS SKIP] interrupted before start")
-            return
+        # ============================================
+        # 音声クローン（別スレッド実行）
+        # ============================================
+        #audio_list, sr  = 
+        stream = await asyncio.to_thread(
+            tts_model.generate_voice_clone_streaming,
+            text=text,
+            language="Japanese",
+            voice_clone_prompt=VOICE_PROMPT,
+            chunk_size=8,
+        )
 
-        # TTS モデルへの排他アクセス
-        # 前のターンのTTSがモデルを使い終わるまで待つ
-        acquired = await asyncio.to_thread(tts_lock.acquire)
-        try:
-            if interrupt_event.is_set():
-                print("[TTS SKIP] interrupted while waiting lock")
-                return
 
-            stream = await asyncio.to_thread(
-                tts_model.generate_voice_clone_streaming,
-                text=text,
-                language="Japanese",
-                voice_clone_prompt=VOICE_PROMPT,
-                chunk_size=8,
-            )
-        finally:
-            tts_lock.release()
+        print(
+            f"[TTS GEN TIME] "
+            f"{time.perf_counter() - t0:.2f}s"
+        )
 
-        gen_time = time.perf_counter() - t0
-        if gen_time > 0.5:
-            print(f"[TTS GEN TIME] {gen_time:.2f}s")
 
         first_chunk = True
+        first_item = True
         silent_chunks = 0
+        
+        t1 = time.perf_counter()
+        last_chunk_time = time.perf_counter()
 
         for item in stream:
 
+            now = time.perf_counter()
+
+            print(
+                "[CHUNK GAP]",
+                now - last_chunk_time
+            )
+
+            last_chunk_time = now
+
+            if first_item:
+                print(
+                    "[FIRST ITEM]",
+                    time.perf_counter() - t1
+                )
+                first_item = False
+
             if interrupt_event.is_set():
-                print("[TTS INTERRUPTED]")
+
+                print("\n[TTS INTERRUPTED]")
                 return
 
+            # ==================================================
             # streaming版の返却形式
+            # ==================================================
+
             if isinstance(item, tuple):
-                pcm_chunk, sr, timing = item
+
+                print(
+                    "[TUPLE TYPES]",
+                    type(item[0]),
+                    type(item[1])
+                )
+
+                # Qwen3-TTS-fast は
+                # (audio, sr, timing)
+                pcm_chunk, sr, timing  = item
+
+            # dict
             elif isinstance(item, dict):
+
                 sr = item.get("sampling_rate", 24000)
+
                 pcm_chunk = item.get("audio", None)
+
             else:
+
+                print("[UNKNOWN STREAM ITEM]", item)
                 continue
 
             if pcm_chunk is None:
@@ -793,10 +838,15 @@ async def streaming_tts(text):
             )
 
             if first_chunk:
-                print(f"[FIRST AUDIO LATENCY] {time.perf_counter()-t0:.3f}s")
+
+                print(
+                    f"[FIRST AUDIO LATENCY] "
+                    f"{time.perf_counter()-t0:.3f}s"
+                )
+
                 first_chunk = False
 
-            audio_out_queue.put((24000, pcm_chunk))
+            ring_write(pcm_chunk)
 
     except Exception as e:
 
@@ -819,11 +869,6 @@ async def tts_worker():
         if text is None:
             break
 
-        # ターン終了 → response() のブロックを解除
-        if text is TURN_END:
-            audio_out_queue.put(None)
-            continue
-
         try:
 
             await streaming_tts(text)
@@ -843,13 +888,6 @@ async def realtime_pipeline(audio):
     global LAST_AI_SPEAK_TIME
 
     interrupt_event.clear()
-
-    # 前ターンの残りテキストをクリア（旧TTSテキストを捨てる）
-    while not tts_text_queue.empty():
-        try:
-            tts_text_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            break
 
     sample_rate, audio_np = audio
 
@@ -899,7 +937,6 @@ async def realtime_pipeline(audio):
             f"{since_ai:.2f}s"
         )
 
-        audio_out_queue.put(None)
         return
 
     # ========================================================
@@ -916,7 +953,6 @@ async def realtime_pipeline(audio):
     if peak < threshold:
 
         print("\n[SKIP] silence\n")
-        audio_out_queue.put(None)
         return
 
     # ========================================================
@@ -938,7 +974,6 @@ async def realtime_pipeline(audio):
     if not final_text.strip():
 
         print("\n[EMPTY ASR]\n")
-        audio_out_queue.put(None)
         return
 
     # ========================================================
@@ -954,14 +989,136 @@ async def realtime_pipeline(audio):
     ):
 
         if interrupt_event.is_set():
-            break
+            return
 
-        if partial:
-            print(f"[AI] {partial}")
-            await tts_text_queue.put(partial)
+        print("\n[AI]")
+        print(partial)
 
-    # ターン終了を通知（中断時も含む）
-    await tts_text_queue.put(TURN_END)
+        await tts_text_queue.put(partial)
+
+
+# ============================================================
+# ring_available
+# ============================================================
+
+def ring_available():
+
+    with ring_lock:
+
+        return (
+            ring_write_pos
+            - ring_read_pos
+        ) % RING_BUFFER_SIZE
+
+# ============================================================
+# ring_read
+# ============================================================
+
+def ring_read(frames):
+
+    global ring_read_pos
+
+    out = np.zeros(
+        frames,
+        dtype=np.float32
+    )
+
+    with ring_lock:
+
+        available = (
+            ring_write_pos
+            - ring_read_pos
+        ) % RING_BUFFER_SIZE
+
+        if available == 0:
+            return out
+
+        read_frames = min(
+            frames,
+            available
+        )
+
+        end = ring_read_pos + read_frames
+
+        if end < RING_BUFFER_SIZE:
+
+            out[:read_frames] = (
+                audio_ring[
+                    ring_read_pos:end
+                ]
+            )
+
+        else:
+
+            first = (
+                RING_BUFFER_SIZE
+                - ring_read_pos
+            )
+
+            out[:first] = (
+                audio_ring[
+                    ring_read_pos:
+                ]
+            )
+
+            out[first:read_frames] = (
+                audio_ring[
+                    :read_frames-first
+                ]
+            )
+
+        ring_read_pos = (
+            ring_read_pos + read_frames
+        ) % RING_BUFFER_SIZE
+
+    return out
+
+
+# ============================================================
+# ring write
+# ============================================================
+
+def ring_write(audio):
+
+    global ring_write_pos
+
+    audio = np.asarray(
+        audio,
+        dtype=np.float32
+    ).reshape(-1)
+
+    n = len(audio)
+
+    with ring_lock:
+
+        end = ring_write_pos + n
+
+        # wrapなし
+        if end < RING_BUFFER_SIZE:
+
+            audio_ring[
+                ring_write_pos:end
+            ] = audio
+
+        # wrapあり
+        else:
+
+            first = (
+                RING_BUFFER_SIZE
+                - ring_write_pos
+            )
+
+            audio_ring[
+                ring_write_pos:
+            ] = audio[:first]
+
+            audio_ring[
+                :n-first
+            ] = audio[first:]
+
+        ring_write_pos = (
+            ring_write_pos + n
+        ) % RING_BUFFER_SIZE
 
 
 # ============================================================
@@ -970,16 +1127,17 @@ async def realtime_pipeline(audio):
 
 async def clear_audio_queue():
 
-    # キューを空にして response() をアンブロック
-    while not audio_out_queue.empty():
-        try:
-            audio_out_queue.get_nowait()
-        except Exception:
-            break
+    global ring_read_pos
+    global ring_write_pos
 
-    audio_out_queue.put(None)
+    with ring_lock:
 
-    print("\n[AUDIO QUEUE CLEARED]\n")
+        ring_read_pos = 0
+        ring_write_pos = 0
+
+        audio_ring.fill(0)
+
+    print("\n[RING BUFFER CLEARED]\n")
 
 # ============================================================
 # CALLBACK
@@ -987,17 +1145,11 @@ async def clear_audio_queue():
 
 def response(audio):
 
+    print("[WEBRTC START]",
+        threading.get_ident()
+    )
+
     try:
-
-        # 新ターン開始: 常に旧処理を停止してキューをリセット
-        interrupt_event.set()
-
-        # audio_out_queue を同期クリア（旧音声を捨てる）
-        while not audio_out_queue.empty():
-            try:
-                audio_out_queue.get_nowait()
-            except Exception:
-                break
 
         asyncio.run_coroutine_threadsafe(
             realtime_pipeline(audio),
@@ -1006,37 +1158,76 @@ def response(audio):
 
     except Exception as e:
 
-        print("\n[PIPELINE ERROR]")
         print(e)
         return
 
-    # TTSチャンクをブラウザへストリーミング送信
+    chunk_size = 960
+
+    started = False
+
+    empty_loops = 0
+
     while True:
 
-        try:
-            item = audio_out_queue.get(timeout=30)
-        except queue.Empty:
-            break
+        available = ring_available()
 
-        if item is None:
-            break
+        # ==================================
+        # データあり
+        # ==================================
 
-        yield item
+        if available >= chunk_size:
+            print(
+                "[WEBRTC SEND]",
+                available
+            )
+
+            started = True
+
+            chunk = ring_read(
+                chunk_size
+            )
+
+            yield (
+                24000,
+                chunk
+            )
+
+            empty_loops = 0
+
+        # ==================================
+        # データなし
+        # ==================================
+
+        else:
+
+            # まだTTS開始前
+            if not started:
+
+                time.sleep(0.01)
+                continue
+
+            # TTS終了待ち
+            empty_loops += 1
+
+            #if empty_loops > 50:
+            if (
+                empty_loops > 50
+                and tts_text_queue.empty() #空でなければ止めない
+            ):
+
+                print(
+                    "[WEBRTC STREAM END]",
+                    threading.get_ident()
+                )
+
+                break
+
+            time.sleep(0.01)
 
 
 # ============================================================
 # FASTRTC
 # ============================================================
-
-# ============================================================
-# TURN SERVER CONFIG
-# LAN内 coturn のIPとポートに書き換えてください
-# apt install coturn で立てたサーバーのLAN IP
-# ============================================================
-TURN_SERVER_IP = None
-TURN_PORT      = None
-TURN_USER      = None
-TURN_PASS      = None
 
 stream = Stream(
     ReplyOnPause(
@@ -1044,8 +1235,6 @@ stream = Stream(
         can_interrupt=True,
     ),
     modality="audio",
-    # AIコンテナを network_mode: host にした場合は rtc_configuration 不要
-    # ホストの実IPがICE candidateに入るのでTURN経由不要
 )
 
 
@@ -1066,38 +1255,11 @@ def loop_runner():
 
     loop.run_forever()
 
+
 threading.Thread(
     target=loop_runner,
     daemon=True,
 ).start()
-
-# ============================================================
-# SUPPRESS AIOICE / UVICORN NOISE
-# ============================================================
-
-import logging
-
-# uvicorn アクセスログのスパム抑制
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-# aioice の send_stun をパッチ
-# ブラウザ切断後に socket が None になった状態で
-# STUN リトライが来ても AttributeError を静かに無視する
-try:
-    import aioice.ice as _aioice_ice
-
-    _orig_send_stun = _aioice_ice.StunProtocol.send_stun
-
-    def _safe_send_stun(self, message, addr):
-        try:
-            _orig_send_stun(self, message, addr)
-        except AttributeError:
-            pass  # transport/socket 既にクローズ済み → 無視
-
-    _aioice_ice.StunProtocol.send_stun = _safe_send_stun
-
-except Exception:
-    pass
 
 # ============================================================
 # MAIN
