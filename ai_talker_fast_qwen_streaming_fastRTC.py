@@ -41,6 +41,8 @@ pip install faster-qwen3-tts
 
 # FastRTC
 pip install "fastrtc[vad]"
+#vadを利用する実装
+pip install silero-vad
 
 # llama.cpp CUDA
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
@@ -106,7 +108,7 @@ os.environ["PATH"] += r";C:\lib\sox"
 import numpy as np
 import librosa
 import soundfile as sf
-#import sounddevice as sd
+import sounddevice as sd
 
 import torch
 
@@ -117,14 +119,19 @@ from llama_cpp import Llama
 #from qwen_tts import Qwen3TTSModel
 from faster_qwen3_tts import FasterQwen3TTS
 
-from fastrtc import (
-    Stream,
-    ReplyOnPause,
-)
+#from fastrtc import (
+#    Stream,
+#    ReplyOnPause,
+#)
+from fastrtc import Stream, StreamHandler  # StreamHandler も必要
+import silero_vad
+
 
 import re
 import gc
 import threading
+
+
 
 # ============================================================
 # CONFIG
@@ -194,6 +201,10 @@ playback_worker_task = None
 
 REFERENCE_AUDIO = None
 
+current_pipeline_task = None   # 現在実行中のパイプラインタスク
+current_tts_task = None
+generator_lock = threading.Lock()
+
 # ============================================================
 # RING BUFFER
 # ============================================================
@@ -224,6 +235,8 @@ IS_AI_SPERKING = False
 
 # 最後にAIが喋った時刻
 LAST_AI_SPEAK_TIME = 0.0
+
+MAX_HISTORY_TURNS = 4  # ユーザー＋アシスタントで4往復（8メッセージ）+ system
 
 conversation_history = [
     {
@@ -602,6 +615,24 @@ async def streaming_asr(audio_np, sr):
 
     yield text.strip()
 
+
+# ============================================================
+# 会話履歴の制御
+# ============================================================
+
+def trim_conversation_history():
+    global conversation_history
+    # system メッセージは先頭に固定
+    system_msg = conversation_history[0] if conversation_history and conversation_history[0]["role"] == "system" else None
+    # ユーザーとアシスタントのペアを最新の MAX_HISTORY_TURNS ターンだけ残す
+    messages = conversation_history if system_msg is None else conversation_history[1:]
+    # 最大メッセージ数 = MAX_HISTORY_TURNS * 2
+    max_messages = MAX_HISTORY_TURNS * 2
+    if len(messages) > max_messages:
+        messages = messages[-max_messages:]
+        conversation_history = ([system_msg] if system_msg else []) + messages
+        print(f"[TRIM] History trimmed to {len(conversation_history)} messages")
+
 # ============================================================
 # STREAMING LLM
 # ============================================================
@@ -609,6 +640,9 @@ async def streaming_asr(audio_np, sr):
 async def stream_llm(user_text):
 
     global conversation_history
+
+    # 会話履歴の削除
+    trim_conversation_history()
 
     conversation_history.append({
         "role": "user",
@@ -619,16 +653,13 @@ async def stream_llm(user_text):
         messages=conversation_history,
         stream=True,
         temperature=0.7,
-        max_tokens=128,
+        max_tokens=2048,
     )
 
     full_text = ""
     thinking = False
 
     for chunk in stream:
-
-        if interrupt_event.is_set():
-            return
 
         try:
 
@@ -708,8 +739,7 @@ async def token_chunker(token_stream):
 # ============================================================
 # STREAMING TTS
 # ============================================================
-
-async def streaming_tts(text):
+async def _streaming_tts_impl(text):
 
     try:
 
@@ -770,11 +800,6 @@ async def streaming_tts(text):
                     time.perf_counter() - t1
                 )
                 first_item = False
-
-            if interrupt_event.is_set():
-
-                print("\n[TTS INTERRUPTED]")
-                return
 
             # ==================================================
             # streaming版の返却形式
@@ -878,26 +903,50 @@ async def tts_worker():
             print("\n[TTS WORKER ERROR]")
             print(e)
 
+
+# ============================================================
+# PIPELINEラッパー
+# ============================================================
+async def realtime_pipeline(audio):
+    global current_pipeline_task
+    
+    # 前のタスクをキャンセル
+    if current_pipeline_task and not current_pipeline_task.done():
+        current_pipeline_task.cancel()
+        try:
+            await current_pipeline_task
+        except asyncio.CancelledError:
+            print("[PIPELINE] Previous cancelled")
+    
+    # リングバッファをクリア（再生中の音声を即座に消す）
+    with ring_lock:
+        global ring_read_pos, ring_write_pos
+        ring_read_pos = 0
+        ring_write_pos = 0
+        audio_ring.fill(0)
+    
+    # 新しいパイプラインを実行
+    current_pipeline_task = asyncio.create_task(_realtime_pipeline_impl(audio))
+    try:
+        await current_pipeline_task
+    except asyncio.CancelledError:
+        print("[PIPELINE] Current cancelled")
+    finally:
+        if current_pipeline_task == asyncio.current_task():
+            current_pipeline_task = None
+
 # ============================================================
 # PIPELINE
 # ============================================================
 
-async def realtime_pipeline(audio):
-
-    global audio_task
+async def _realtime_pipeline_impl(audio):
     global LAST_AI_SPEAK_TIME
-
-    interrupt_event.clear()
 
     sample_rate, audio_np = audio
 
     print("\n================================================")
     print("USER")
     print("================================================")
-
-    # ========================================================
-    # FastRTC audio normalize
-    # ========================================================
 
     print("\n[AUDIO INFO]")
     print("sample_rate:", sample_rate)
@@ -906,96 +955,63 @@ async def realtime_pipeline(audio):
 
     # (channels, samples) -> mono
     if audio_np.ndim > 1:
-
         audio_np = audio_np.mean(axis=0)
 
     # int16 -> float32 (-1~1)
     if audio_np.dtype == np.int16:
-
-        audio_np = (
-            audio_np.astype(np.float32)
-            / 32768.0
-        )
-
+        audio_np = audio_np.astype(np.float32) / 32768.0
     else:
-
         audio_np = audio_np.astype(np.float32)
 
-    # ========================================================
-    # AI SPEAKING FILTER
-    # ========================================================
-
-    # AI発話直後のマイク入力は捨てる
-    # 自分の声ループ防止
-
+    # AI発話直後のマイク入力は捨てる（クールダウン 1.5秒に延長）
     since_ai = time.time() - LAST_AI_SPEAK_TIME
-
-    if since_ai < 0.8:
-
-        print(
-            f"\n[SKIP AI VOICE] "
-            f"{since_ai:.2f}s"
-        )
-
+    if since_ai < 1.5:
+        print(f"\n[SKIP AI VOICE] {since_ai:.2f}s")
         return
 
-    # ========================================================
-    # silence check
-    # ========================================================
-
+    # 無音チェック
     peak = np.max(np.abs(audio_np))
-
     threshold = 0.015
-
-    print("peak:", peak)
-    print("threshold:", threshold)
-
+    print("peak:", peak, "threshold:", threshold)
     if peak < threshold:
-
         print("\n[SKIP] silence\n")
         return
 
-    # ========================================================
     # ASR
-    # ========================================================
-
     final_text = ""
-
-    async for partial_text in streaming_asr(
-        audio_np,
-        sample_rate
-    ):
-
+    async for partial_text in streaming_asr(audio_np, sample_rate):
         final_text = partial_text
-
-        print("\n[ASR]")
-        print(partial_text)
+        print("\n[ASR]", partial_text)
 
     if not final_text.strip():
-
         print("\n[EMPTY ASR]\n")
         return
 
-    # ========================================================
     # LLM
-    # ========================================================
-
-    token_stream = stream_llm(
-        final_text
-    )
-
-    async for partial in token_chunker(
-        token_stream
-    ):
-
-        if interrupt_event.is_set():
-            return
-
-        print("\n[AI]")
-        print(partial)
-
+    token_stream = stream_llm(final_text)
+    async for partial in token_chunker(token_stream):
+        print("\n[AI]", partial)
         await tts_text_queue.put(partial)
 
+# ------------------------------------------------------------
+# TTS のタスク管理ラッパー
+# ------------------------------------------------------------
+async def streaming_tts(text):
+    global current_tts_task
+    if current_tts_task and not current_tts_task.done():
+        current_tts_task.cancel()
+        try:
+            await current_tts_task
+        except asyncio.CancelledError:
+            print("[TTS] Previous task cancelled")
+    current_tts_task = asyncio.create_task(_streaming_tts_impl(text))
+    try:
+        await current_tts_task
+    except asyncio.CancelledError:
+        print("[TTS] Current task cancelled")
+    finally:
+        if current_tts_task == asyncio.current_task():
+            current_tts_task = None
 
 # ============================================================
 # ring_available
@@ -1080,7 +1096,7 @@ def ring_read(frames):
 
 def ring_write(audio):
 
-    global ring_write_pos
+    global ring_write_pos, LAST_AI_SPEAK_TIME   # ← LAST_AI_SPEAK_TIME を追加
 
     audio = np.asarray(
         audio,
@@ -1120,6 +1136,9 @@ def ring_write(audio):
             ring_write_pos + n
         ) % RING_BUFFER_SIZE
 
+        # 書き込みが完了したら時刻を更新（AIが喋っている最中であることを記録）
+        LAST_AI_SPEAK_TIME = time.time()
+
 
 # ============================================================
 # AUDIO QUEUE CLEAR
@@ -1143,123 +1162,137 @@ async def clear_audio_queue():
 # CALLBACK
 # ============================================================
 
-def response(audio):
+class VoiceAIHandler(StreamHandler):
+    def __init__(self):
+        super().__init__(input_sample_rate=48000, output_sample_rate=24000)
+        # Silero VAD モデルをロード（ONNX or Torch）
+        self.vad_model = silero_vad.load_silero_vad()
+        # 設定
+        self.sample_rate = 48000
+        self.chunk_duration = 0.5  # 発話判定の基本単位（秒）
+        self.chunk_samples = int(self.sample_rate * self.chunk_duration)
+        self.silence_timeout = 0.6  # 無音が続くべき秒数
+        self.silence_chunks_needed = int(self.silence_timeout / self.chunk_duration)
+        
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.buffer_lock = threading.Lock()
+        self.speech_buffer = None   # 発話中のバッファ
+        self.silence_counter = 0
+        self.current_task = None
 
-    print("[WEBRTC START]",
-        threading.get_ident()
-    )
-
-    try:
-
-        asyncio.run_coroutine_threadsafe(
-            realtime_pipeline(audio),
-            loop
-        )
-
-    except Exception as e:
-
-        print(e)
-        return
-
-    chunk_size = 960
-
-    started = False
-
-    empty_loops = 0
-
-    while True:
-
-        available = ring_available()
-
-        # ==================================
-        # データあり
-        # ==================================
-
-        if available >= chunk_size:
-            print(
-                "[WEBRTC SEND]",
-                available
-            )
-
-            started = True
-
-            chunk = ring_read(
-                chunk_size
-            )
-
-            yield (
-                24000,
-                chunk
-            )
-
-            empty_loops = 0
-
-        # ==================================
-        # データなし
-        # ==================================
-
+    def _is_speech(self, audio_chunk):
+        """音声チャンクが音声を含むかどうかをVADで判定"""
+        # silero_vad は 16kHz を想定しているためリサンプル必要
+        if self.sample_rate != 16000:
+            # librosa などでリサンプル（簡易的にダウンサンプリング）
+            import librosa
+            chunk_16k = librosa.resample(audio_chunk, orig_sr=self.sample_rate, target_sr=16000)
         else:
+            chunk_16k = audio_chunk
+        # テンソルに変換してVAD実行
+        import torch
+        tensor = torch.from_numpy(chunk_16k).float()
+        speech_prob = silero_vad.get_speech_timestamps(tensor, self.vad_model, sampling_rate=16000)
+        return len(speech_prob) > 0
 
-            # まだTTS開始前
-            if not started:
+    def receive(self, frame):
+        sr, audio_np = frame
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(axis=0)
+        if audio_np.dtype == np.int16:
+            audio_np = audio_np.astype(np.float32) / 32768.0
+        
+        with self.buffer_lock:
+            # 常にバッファに追加
+            self.audio_buffer = np.concatenate((self.audio_buffer, audio_np))
+            
+            # 設定したチャンクサイズ未満なら何もしない
+            if len(self.audio_buffer) < self.chunk_samples:
+                return
+            
+            # チャンクを切り出し
+            chunk = self.audio_buffer[:self.chunk_samples]
+            self.audio_buffer = self.audio_buffer[self.chunk_samples:]
+            
+            # VAD で音声判定
+            if self._is_speech(chunk):
+                # 音声あり
+                self.silence_counter = 0
+                if self.speech_buffer is None:
+                    self.speech_buffer = chunk
+                else:
+                    self.speech_buffer = np.concatenate((self.speech_buffer, chunk))
+            else:
+                # 無音
+                self.silence_counter += 1
+                if self.speech_buffer is not None:
+                    # 無音が閾値に達したら発話終了
+                    if self.silence_counter >= self.silence_chunks_needed:
+                        # 発話終了！ 溜めた音声を処理
+                        full_audio = self.speech_buffer
+                        self.speech_buffer = None
+                        asyncio.run_coroutine_threadsafe(
+                            self._process_audio(full_audio, sr),
+                            background_loop
+                        )
+                    else:
+                        # まだ発話継続中とみなし、無音チャンクもバッファに追加
+                        if self.speech_buffer is not None:
+                            self.speech_buffer = np.concatenate((self.speech_buffer, chunk))
 
-                time.sleep(0.01)
-                continue
+    async def _process_audio(self, audio_np, original_sr):
+        # 前のタスクをキャンセル
+        if self.current_task and not self.current_task.done():
+            self.current_task.cancel()
+            try:
+                await self.current_task
+            except asyncio.CancelledError:
+                pass
+            # リングバッファクリア
+            with ring_lock:
+                global ring_read_pos, ring_write_pos
+                ring_read_pos = 0
+                ring_write_pos = 0
+                audio_ring.fill(0)
+        
+        # 新しいパイプライン開始
+        self.current_task = asyncio.create_task(
+            _realtime_pipeline_impl((original_sr, audio_np))
+        )
+        try:
+            await self.current_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self.current_task == asyncio.current_task():
+                self.current_task = None
 
-            # TTS終了待ち
-            empty_loops += 1
+    def emit(self):
+        chunk_size = 960
+        available = ring_available()
+        if available < chunk_size:
+            return None
+        chunk = ring_read(chunk_size)
+        return (24000, chunk)
 
-            #if empty_loops > 50:
-            if (
-                empty_loops > 50
-                and tts_text_queue.empty() #空でなければ止めない
-            ):
-
-                print(
-                    "[WEBRTC STREAM END]",
-                    threading.get_ident()
-                )
-
-                break
-
-            time.sleep(0.01)
-
+    def copy(self):
+        return VoiceAIHandler()
 
 # ============================================================
 # FASTRTC
 # ============================================================
-
-stream = Stream(
-    ReplyOnPause(
-        response,
-        can_interrupt=True,
-    ),
-    modality="audio",
-)
-
+# Stream の作成
+stream = Stream(VoiceAIHandler(), modality="audio")
 
 # ============================================================
 # START PLAYBACK WORKER
 # ============================================================
-
-loop = asyncio.new_event_loop()
-
+background_loop = asyncio.new_event_loop()
 def loop_runner():
-
-    asyncio.set_event_loop(loop)
-
-    loop.create_task(
-        tts_worker()
-    )
-
-
-    loop.run_forever()
-
-
-threading.Thread(
-    target=loop_runner,
-    daemon=True,
-).start()
+    asyncio.set_event_loop(background_loop)
+    background_loop.create_task(tts_worker())
+    background_loop.run_forever()
+threading.Thread(target=loop_runner, daemon=True).start()
 
 # ============================================================
 # MAIN
