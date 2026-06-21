@@ -1,24 +1,7 @@
 """
 ====================================================================
-RTX3080向け 超低遅延リアルタイム音声AI
-FastRTC + faster-whisper + Qwen3 4B Q4 + Qwen3-TTS
-Voice Clone選択/録音対応 完全版
+リアルタイム音声AI
 ====================================================================
-
-2026 安定版構成
---------------------------------------------------------------------
-✓ faster-whisper へ変更（Qwen3-ASR依存競合回避）
-✓ transformers競合回避
-✓ RTX3080最適化
-✓ Streaming LLM
-✓ Streaming TTS
-✓ 割り込み対応
-✓ Playback Cancel
-✓ Voice Clone
-✓ Mic Voice Clone
-✓ WebRTC
-✓ CUDA最適化
-✓ chunked realtime response
 
 ====================================================================
 pip install
@@ -52,6 +35,9 @@ pip install numpy librosa soundfile #sounddevice
 
 # ASR
 pip install faster-whisper
+
+#絵文字トリム用
+pip install emoji
 
 ====================================================================
 必要モデル
@@ -123,6 +109,7 @@ from faster_qwen3_tts import FasterQwen3TTS
 #    Stream,
 #    ReplyOnPause,
 #)
+#from fastrtc import Stream, AsyncStreamHandler
 from fastrtc import Stream, StreamHandler  # StreamHandler も必要
 import silero_vad
 
@@ -131,7 +118,15 @@ import re
 import gc
 import threading
 
+import emoji
 
+
+# ============================================================
+# UI追加
+# ============================================================
+import gradio as gr
+import uvicorn
+from fastapi import FastAPI
 
 # ============================================================
 # CONFIG
@@ -206,6 +201,23 @@ current_tts_task = None
 generator_lock = threading.Lock()
 
 # ============================================================
+# 音声感度設定
+# ============================================================
+#AI発話監視感覚
+CHECK_INTERVAL = 0.5
+
+#AI最終発話後のクールタイム（エコー対策）
+COOL_TIME = 0.7
+
+#マイクの感度（AI発話中には感度低く）
+MIC_THRESHOLD =  0.4
+MIC_THRESHOLD_AI_SPERK = 0.6
+
+#割り込み判定値（AI発話中はAI音声の可能性を踏まえ厳しめに）
+CHECK_THRESHOLD = 0.015
+CHECK_THRESHOLD_AI_SPERK = 0.4
+
+# ============================================================
 # RING BUFFER
 # ============================================================
 
@@ -236,20 +248,25 @@ IS_AI_SPERKING = False
 # 最後にAIが喋った時刻
 LAST_AI_SPEAK_TIME = 0.0
 
-MAX_HISTORY_TURNS = 4  # ユーザー＋アシスタントで4往復（8メッセージ）+ system
+#LLMの会話履歴保持数
+MAX_HISTORY_TURNS = 3  # ユーザー＋アシスタントで3往復（6メッセージ）+ system
 
+#LLMのプロンプト
 conversation_history = [
     {
         "role": "system",
         "content": """
-あなたは対話型AIです。
-楽しく会話を行うことが目的です。
+あなたは対話型AIです。ルールを厳守し、応答してください。
 
-ルール:
-- 会話テンポ優先
-- 入力メッセージが今までの会話とかみ合わなければ聞き間違いを疑う
-- 内部思考を出力しない
-- thinkタグを出力しない
+# ルール:
+- あなたは音声読み上げ前提で応答する。箇条書き禁止。絵文字、記号禁止。読上可能な文章で応答する。
+- キャラクター設定になりきって回答する。
+- 過剰な長文、短文での応対は禁止。
+
+# キャラクター設定:
+- 優しい男性。娘に話しかけるように。
+- 難しい言葉を避け、丁寧に応対する。
+
 """
     }
 ]
@@ -317,7 +334,6 @@ def preprocess_reference_audio(path):
         audio,
         24000
     )
-
     return save_path
 
 # ============================================================
@@ -361,92 +377,6 @@ def record_reference_voice():
     print(f"\n保存: {processed}\n")
 
     return processed
-
-# ============================================================
-# SELECT VOICE
-# ============================================================
-
-def select_voice():
-
-    global REFERENCE_AUDIO
-
-    print("""
-================================================
-Voice Clone設定
-================================================
-
-1. 既存voiceを使う
-2. マイク録音
-3. 外部ファイル指定
-
-================================================
-""")
-
-    mode = input("選択: ").strip()
-
-    # ========================================================
-    # MIC
-    # ========================================================
-
-    if mode == "2":
-
-        REFERENCE_AUDIO = record_reference_voice()
-        return
-
-    # ========================================================
-    # FILE
-    # ========================================================
-
-    elif mode == "3":
-
-        path = input(
-            "\n音声ファイルパス: "
-        ).strip()
-
-        REFERENCE_AUDIO = preprocess_reference_audio(
-            path
-        )
-
-        print(f"\n選択: {REFERENCE_AUDIO}\n")
-
-        return
-
-    # ========================================================
-    # EXISTING
-    # ========================================================
-
-    voices = list_voice_files()
-
-    if len(voices) == 0:
-
-        print("\nvoiceがありません")
-        print("録音モードへ移行します\n")
-
-        REFERENCE_AUDIO = record_reference_voice()
-
-        return
-
-    print("\n利用可能voice:\n")
-
-    for idx, file in enumerate(voices):
-
-        print(f"{idx+1}. {file.name}")
-
-    print()
-
-    idx = int(input("番号選択: ")) - 1
-
-    selected = str(voices[idx])
-
-    REFERENCE_AUDIO = selected
-
-    print(f"\n選択: {REFERENCE_AUDIO}\n")
-
-# ============================================================
-# SELECT VOICE
-# ============================================================
-
-select_voice()
 
 # ============================================================
 # LOAD ASR
@@ -511,8 +441,10 @@ llm = Llama(
     use_mmap=True,
     use_mlock=False,
     verbose=False,
-    chat_format="chatml"
-    
+    #chat_format="chatml" #無限ループEOS欠落の原因？
+    offload_kqv=True,   # KVキャッシュのGPUオフロードを有効化
+    logits_all=True,    # ロジット計算の安定化を図る
+
 )
 
 print("LLM OK")
@@ -530,11 +462,6 @@ gc.collect()
 tts_model = FasterQwen3TTS.from_pretrained(
     TTS_MODEL,
 )
-#    device_map="cuda:0",
-#    dtype=torch.bfloat16,
-#    attn_implementation="sdpa",
-
-
 
 print("TTS OK")
 
@@ -544,26 +471,37 @@ print("TTS OK")
 
 print("TEXT AND PRONPT START")
 
-REFERENCE_TEXT = generate_reference_text(REFERENCE_AUDIO)
-print("REFERENCE_TEXT OK")
+# ============================================================
+# 初期設定（UIで設定されるまでデフォルトの音声を使う）
+# ============================================================
+# デフォルトの音声ファイルがあれば自動設定
+default_voices = list_voice_files()
+print("[DEBUG] Voice files at startup:", list_voice_files())  
 
-#プロンプトも生成
-VOICE_PROMPT = tts_model.model.create_voice_clone_prompt(
-    ref_audio=REFERENCE_AUDIO,
-    ref_text=REFERENCE_TEXT,
-    x_vector_only_mode=True,
-)
-print("VOICE_PROMPT OK")
+if default_voices:
+    REFERENCE_AUDIO = str(default_voices[0])
+    REFERENCE_TEXT = generate_reference_text(REFERENCE_AUDIO)
+    VOICE_PROMPT = tts_model.model.create_voice_clone_prompt(
+        ref_audio=REFERENCE_AUDIO,
+        ref_text=REFERENCE_TEXT,
+        x_vector_only_mode=True,
+    )
+    print(f"[INIT] Default voice: {os.path.basename(REFERENCE_AUDIO)}")
 
-print("TEST RUN")
+    print("TEST RUN")
 
-# 2回目以降の高速化
-boo = tts_model.generate_voice_clone(
-    text="REFERENCE_TEXT",
-    language="Japanese",
-    voice_clone_prompt=VOICE_PROMPT,
-)
-print("TEST RUN OK")
+    # 2回目以降の高速化
+    boo = tts_model.generate_voice_clone(
+        text=REFERENCE_TEXT,
+        language="Japanese",
+        voice_clone_prompt=VOICE_PROMPT,
+    )
+    print("TEST RUN OK")
+
+else:
+    print("[WARN] No voice file found. Please set voice from browser UI.")
+
+
 
 # ============================================================
 # DEBUG
@@ -640,6 +578,7 @@ def trim_conversation_history():
 async def stream_llm(user_text):
 
     global conversation_history
+    print("\n[TRIM HISTORY]\n")
 
     # 会話履歴の削除
     trim_conversation_history()
@@ -648,7 +587,7 @@ async def stream_llm(user_text):
         "role": "user",
         "content": user_text
     })
-
+    print("\n[HISTORY]:" , conversation_history)
     stream = llm.create_chat_completion(
         messages=conversation_history,
         stream=True,
@@ -656,10 +595,13 @@ async def stream_llm(user_text):
         max_tokens=2048,
     )
 
+    print("\n[GET STREAM]\n")
+
     full_text = ""
     thinking = False
 
     for chunk in stream:
+
 
         try:
 
@@ -694,8 +636,11 @@ async def stream_llm(user_text):
 
             yield token
 
-        except:
-            pass
+        except Exception as e:
+            print("\n[AI LLM ERROR]")
+            print(type(e))
+            print(e)
+            pass #継続する
 
     conversation_history.append({
         "role": "assistant",
@@ -725,31 +670,36 @@ async def token_chunker(token_stream):
 
             current = ""
 
-        # 長すぎ防止
-        elif len(current) >= 48:
-
-            yield current.strip()
-
-            current = ""
+        # 長すぎ防止→記号などだけの文字列入力が生まれるため除去！
+        #elif len(current) >= 48:
+            #yield current.strip()
+            #current = ""
 
     if current.strip():
 
         yield current.strip()
 
+
+# ============================================================
+# 絵文字での異常動作対策"""文字列から絵文字（BMP外の文字）を除去する"""
+# ============================================================
+def remove_emojis(text: str) -> str:
+    # 受け取ったテキストから絵文字をすべて削除する
+    return emoji.replace_emoji(text, replace='')
 # ============================================================
 # STREAMING TTS
 # ============================================================
 async def _streaming_tts_impl(text):
 
     try:
-
-        global LAST_AI_SPEAK_TIME
-
-        # ============================================
-        # THINK TOKEN REMOVE
-        # ============================================
+        #print(f"\n[text] original: {repr(text)}")
+        text = remove_emojis(text)
+        #print(f"[text] after remove_emojis: {repr(text)}")
+        text = text.strip()
+        #print(f"[text] after strip: {repr(text)}")
 
         if not text:
+            print("\n[TTS NO TEXT]",text)
             return
 
         print("\n[TTS START]")
@@ -768,7 +718,6 @@ async def _streaming_tts_impl(text):
             voice_clone_prompt=VOICE_PROMPT,
             chunk_size=8,
         )
-
 
         print(
             f"[TTS GEN TIME] "
@@ -872,6 +821,7 @@ async def _streaming_tts_impl(text):
                 first_chunk = False
 
             ring_write(pcm_chunk)
+            await asyncio.sleep(0)   # イベントループに制御を戻す(待ち処理に一度制御渡す)
 
     except Exception as e:
 
@@ -940,7 +890,6 @@ async def realtime_pipeline(audio):
 # ============================================================
 
 async def _realtime_pipeline_impl(audio):
-    global LAST_AI_SPEAK_TIME
 
     sample_rate, audio_np = audio
 
@@ -953,30 +902,6 @@ async def _realtime_pipeline_impl(audio):
     print("shape:", audio_np.shape)
     print("dtype:", audio_np.dtype)
 
-    # (channels, samples) -> mono
-    if audio_np.ndim > 1:
-        audio_np = audio_np.mean(axis=0)
-
-    # int16 -> float32 (-1~1)
-    if audio_np.dtype == np.int16:
-        audio_np = audio_np.astype(np.float32) / 32768.0
-    else:
-        audio_np = audio_np.astype(np.float32)
-
-    # AI発話直後のマイク入力は捨てる（クールダウン 1.5秒に延長）
-    since_ai = time.time() - LAST_AI_SPEAK_TIME
-    if since_ai < 1.5:
-        print(f"\n[SKIP AI VOICE] {since_ai:.2f}s")
-        return
-
-    # 無音チェック
-    peak = np.max(np.abs(audio_np))
-    threshold = 0.015
-    print("peak:", peak, "threshold:", threshold)
-    if peak < threshold:
-        print("\n[SKIP] silence\n")
-        return
-
     # ASR
     final_text = ""
     async for partial_text in streaming_asr(audio_np, sample_rate):
@@ -988,9 +913,10 @@ async def _realtime_pipeline_impl(audio):
         return
 
     # LLM
+    print("\n[START LLM]\n")
     token_stream = stream_llm(final_text)
     async for partial in token_chunker(token_stream):
-        print("\n[AI]", partial)
+        print("\n[LLM]", partial)
         await tts_text_queue.put(partial)
 
 # ------------------------------------------------------------
@@ -1096,7 +1022,9 @@ def ring_read(frames):
 
 def ring_write(audio):
 
-    global ring_write_pos, LAST_AI_SPEAK_TIME   # ← LAST_AI_SPEAK_TIME を追加
+    #発話制御は監視側に完全移行
+    #global ring_write_pos, LAST_AI_SPEAK_TIME   # ← LAST_AI_SPEAK_TIME を追加
+    global ring_write_pos
 
     audio = np.asarray(
         audio,
@@ -1137,7 +1065,7 @@ def ring_write(audio):
         ) % RING_BUFFER_SIZE
 
         # 書き込みが完了したら時刻を更新（AIが喋っている最中であることを記録）
-        LAST_AI_SPEAK_TIME = time.time()
+        #LAST_AI_SPEAK_TIME = time.time()
 
 
 # ============================================================
@@ -1163,72 +1091,193 @@ async def clear_audio_queue():
 # ============================================================
 
 class VoiceAIHandler(StreamHandler):
+    """
+    FastRTC用音声ハンドラ（割り込み機能付き完全版）
+
+    処理フロー:
+    1. receive() で音声チャンクを受信
+    2. 元のコードの音量チェック・クールダウン・ピークチェックを実施
+    3. 条件を満たせば _interrupt() を呼び出し（暫定割り込み）
+    4. 発話終了後 _process_audio() で再度チェック
+    5. 有効ならパイプライン起動、無効ならスキップ
+    """
+
     def __init__(self):
         super().__init__(input_sample_rate=48000, output_sample_rate=24000)
-        # Silero VAD モデルをロード（ONNX or Torch）
+
+        # ---- VAD設定 ----
         self.vad_model = silero_vad.load_silero_vad()
-        # 設定
         self.sample_rate = 48000
-        self.chunk_duration = 0.5  # 発話判定の基本単位（秒）
+        self.chunk_duration = 0.5
         self.chunk_samples = int(self.sample_rate * self.chunk_duration)
-        self.silence_timeout = 0.6  # 無音が続くべき秒数
+        self.silence_timeout = 0.6
         self.silence_chunks_needed = int(self.silence_timeout / self.chunk_duration)
-        
+
+        # ---- バッファ ----
         self.audio_buffer = np.array([], dtype=np.float32)
         self.buffer_lock = threading.Lock()
-        self.speech_buffer = None   # 発話中のバッファ
+        self.speech_buffer = None
         self.silence_counter = 0
         self.current_task = None
 
+        # ---- 内部キュー監視（LAST_AI_SPEAK_TIME更新用） ----
+        self._output_queue = None
+        self._last_check_time = 0
+        self._check_interval = CHECK_INTERVAL
+        self._is_check = False
+
+    # ============================================================
+    # 内部キューアクセス
+    # ============================================================
+    def _get_output_queue(self):
+        """FastRTC内部の音声出力キューを取得する（キャッシュ対応）"""
+        if self._output_queue is not None:
+            return self._output_queue
+        try:
+            if hasattr(self, '_clear_queue') and hasattr(self._clear_queue, '__self__'):
+                audio_callback = self._clear_queue.__self__
+                if hasattr(audio_callback, 'queue'):
+                    self._output_queue = audio_callback.queue
+                    return self._output_queue
+        except Exception as e:
+            print(f"[INTERNAL] Failed to access queue: {e}")
+        return None
+
+    # ============================================================
+    # 出力キュー監視
+    # ============================================================
+    def _check_output_queue(self):
+        """内部キューをチェックし、LAST_AI_SPEAK_TIME を更新"""
+        global LAST_AI_SPEAK_TIME
+        queue = self._get_output_queue()
+        if queue is not None:
+            try:
+                qsize = queue.qsize()
+                if qsize > 0:
+                    LAST_AI_SPEAK_TIME = time.time()
+                else:
+                    self._is_check = False
+                    LAST_AI_SPEAK_TIME = time.time()
+            except Exception as e:
+                print(f"[CHECK] Error: {e}")
+
+    # ============================================================
+    # VAD（音声活動検出）
+    # ============================================================
     def _is_speech(self, audio_chunk):
-        """音声チャンクが音声を含むかどうかをVADで判定"""
-        # silero_vad は 16kHz を想定しているためリサンプル必要
+        """チャンクに音声が含まれるか Silero VAD で判定"""
+        global LAST_AI_SPEAK_TIME
+
         if self.sample_rate != 16000:
-            # librosa などでリサンプル（簡易的にダウンサンプリング）
             import librosa
             chunk_16k = librosa.resample(audio_chunk, orig_sr=self.sample_rate, target_sr=16000)
         else:
             chunk_16k = audio_chunk
-        # テンソルに変換してVAD実行
+
+        #感度調整：AIのノイズをしゃべり続けていると判断させず、マイクインプットを適切に切り取るための設定
+        threshold = MIC_THRESHOLD
+        since_ai = time.time() - LAST_AI_SPEAK_TIME
+        if since_ai < COOL_TIME:
+            threshold = MIC_THRESHOLD_AI_SPERK
+
+
         import torch
         tensor = torch.from_numpy(chunk_16k).float()
-        speech_prob = silero_vad.get_speech_timestamps(tensor, self.vad_model, sampling_rate=16000)
+        speech_prob = silero_vad.get_speech_timestamps(
+            tensor,
+            self.vad_model,
+            sampling_rate=16000,
+            threshold=threshold
+        )
         return len(speech_prob) > 0
 
+    # ============================================================
+    # 割り込み処理（新規追加）
+    # ============================================================
+    def _interrupt(self):
+        """
+        新規発話検出時に前のAI音声を即座に停止する。
+        - タスクキャンセル
+        - リングバッファクリア
+        - FastRTC出力キューをクリア（clear_queue()）
+        - TTSテキストキューをクリア
+        """
+        global current_pipeline_task, current_tts_task, ring_read_pos, ring_write_pos
+
+        # 1. タスクキャンセル
+        for task in (current_pipeline_task, current_tts_task):
+            if task and not task.done():
+                task.cancel()
+
+        # 2. リングバッファクリア
+        with ring_lock:
+            ring_read_pos = 0
+            ring_write_pos = 0
+            audio_ring.fill(0)
+
+        # 3. FastRTC出力キューをクリア
+        self.clear_queue()
+
+        # 4. TTSテキストキューをクリア
+        while not tts_text_queue.empty():
+            try:
+                tts_text_queue.get_nowait()
+            except:
+                break
+
+    # ============================================================
+    # 音声チェック（共通関数化）
+    # ============================================================
+    def _check_audio(self, audio_np):
+        """
+        元のコードの音量チェック・クールダウン・ピークチェックを実施。
+        戻り値: (peak, threshold, is_valid)
+        """
+
+        # しきい値設定
+        threshold = CHECK_THRESHOLD
+        since_ai = time.time() - LAST_AI_SPEAK_TIME
+        if since_ai < COOL_TIME:
+            threshold = CHECK_THRESHOLD_AI_SPERK
+
+        # ピーク計算
+        peak = np.max(np.abs(audio_np))
+
+        return peak, threshold, peak >= threshold
+
+    # ============================================================
+    # FastRTC コールバック：入力音声フレームを受信
+    # ============================================================
     def receive(self, frame):
         sr, audio_np = frame
+
         if audio_np.ndim > 1:
             audio_np = audio_np.mean(axis=0)
         if audio_np.dtype == np.int16:
             audio_np = audio_np.astype(np.float32) / 32768.0
-        
+
+        # ---- バッファに蓄積 ----
         with self.buffer_lock:
-            # 常にバッファに追加
             self.audio_buffer = np.concatenate((self.audio_buffer, audio_np))
-            
-            # 設定したチャンクサイズ未満なら何もしない
             if len(self.audio_buffer) < self.chunk_samples:
                 return
-            
-            # チャンクを切り出し
+
             chunk = self.audio_buffer[:self.chunk_samples]
             self.audio_buffer = self.audio_buffer[self.chunk_samples:]
-            
-            # VAD で音声判定
+
+            # ---- VAD判定 ----
             if self._is_speech(chunk):
-                # 音声あり
                 self.silence_counter = 0
                 if self.speech_buffer is None:
                     self.speech_buffer = chunk
                 else:
                     self.speech_buffer = np.concatenate((self.speech_buffer, chunk))
             else:
-                # 無音
+                # 無音処理
                 self.silence_counter += 1
                 if self.speech_buffer is not None:
-                    # 無音が閾値に達したら発話終了
                     if self.silence_counter >= self.silence_chunks_needed:
-                        # 発話終了！ 溜めた音声を処理
+                        print("[speech buffer stop]")
                         full_audio = self.speech_buffer
                         self.speech_buffer = None
                         asyncio.run_coroutine_threadsafe(
@@ -1236,26 +1285,41 @@ class VoiceAIHandler(StreamHandler):
                             background_loop
                         )
                     else:
-                        # まだ発話継続中とみなし、無音チャンクもバッファに追加
-                        if self.speech_buffer is not None:
-                            self.speech_buffer = np.concatenate((self.speech_buffer, chunk))
+                        self.speech_buffer = np.concatenate((self.speech_buffer, chunk))
 
+    # ============================================================
+    # 発話音声をモノラル化、正規化後にパイプラインに渡す
+    # ============================================================
     async def _process_audio(self, audio_np, original_sr):
-        # 前のタスクをキャンセル
+
+        # 前処理（モノラル化・正規化）
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(axis=0)
+        audio_np = audio_np.astype(np.float32)
+        max_abs = np.abs(audio_np).max()
+        if max_abs > 1.0:
+            audio_np = audio_np / 32768.0
+
+        # 音声チェック：集めた音声自体がノイズの場合はドロップするため
+        peak, threshold, is_valid = self._check_audio(audio_np)
+
+        # 無効な音声はバッファにも入れずに破棄
+        if not is_valid:
+            print("\n[SKIP] silence.[peak]",peak,"[threshold]",threshold)
+            return
+
+        # ★ 新規発話検出 → 割り込み実行 ★
+        print("\nSTART PIPELINE.[peak]",peak,"[threshold]",threshold)
+        self._interrupt()
+
+        # ---- パイプライン起動 ----
         if self.current_task and not self.current_task.done():
             self.current_task.cancel()
             try:
                 await self.current_task
             except asyncio.CancelledError:
                 pass
-            # リングバッファクリア
-            with ring_lock:
-                global ring_read_pos, ring_write_pos
-                ring_read_pos = 0
-                ring_write_pos = 0
-                audio_ring.fill(0)
-        
-        # 新しいパイプライン開始
+
         self.current_task = asyncio.create_task(
             _realtime_pipeline_impl((original_sr, audio_np))
         )
@@ -1267,14 +1331,30 @@ class VoiceAIHandler(StreamHandler):
             if self.current_task == asyncio.current_task():
                 self.current_task = None
 
+    # ============================================================
+    # FastRTC コールバック：出力音声フレームを要求
+    # ============================================================
     def emit(self):
+        now = time.time()
+        #定期感覚で発話チェックを呼び出す
+        if now - self._last_check_time >= self._check_interval:
+            self._last_check_time = now
+            if self._is_check:
+                self._check_output_queue()
+
         chunk_size = 960
         available = ring_available()
         if available < chunk_size:
             return None
+
+        #発話があると確認されたらチェック対象とするフラグを立てる
+        self._is_check = True
         chunk = ring_read(chunk_size)
         return (24000, chunk)
 
+    # ============================================================
+    # FastRTC 必須：ハンドラのコピーを作成
+    # ============================================================
     def copy(self):
         return VoiceAIHandler()
 
@@ -1283,6 +1363,8 @@ class VoiceAIHandler(StreamHandler):
 # ============================================================
 # Stream の作成
 stream = Stream(VoiceAIHandler(), modality="audio")
+print("[DEBUG] stream.ui:", stream.ui)          # ← 追加
+print("[DEBUG] stream.ui type:", type(stream.ui)) # ← 追加
 
 # ============================================================
 # START PLAYBACK WORKER
@@ -1293,6 +1375,160 @@ def loop_runner():
     background_loop.create_task(tts_worker())
     background_loop.run_forever()
 threading.Thread(target=loop_runner, daemon=True).start()
+
+
+# ============================================================
+# GRADIO UI（ブラウザ操作用）
+# ============================================================
+
+# ---- UIハンドラ関数 ----
+def process_voice_from_mic(audio_data):
+    """マイク録音（numpy）から音声クローンを設定"""
+    global REFERENCE_AUDIO, REFERENCE_TEXT, VOICE_PROMPT
+    
+    if audio_data is None:
+        return gr.update(), "❌ 音声が取得できませんでした"
+    
+    sr, audio_np = audio_data
+    temp_path = f"temp_mic_{int(time.time())}.wav"
+    sf.write(temp_path, audio_np, sr)
+    
+    processed = preprocess_reference_audio(temp_path)
+    
+    REFERENCE_AUDIO = processed
+    REFERENCE_TEXT = generate_reference_text(processed)
+    VOICE_PROMPT = tts_model.model.create_voice_clone_prompt(
+        ref_audio=processed,
+        ref_text=REFERENCE_TEXT,
+        x_vector_only_mode=True,
+    )
+    
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    
+    # プルダウン更新用の戻り値
+    updated_choices = refresh_voice_list()
+    selected_name = os.path.basename(processed)
+    return gr.update(choices=updated_choices, value=selected_name), f"✅ マイク音声で設定完了: {selected_name}"
+
+def process_voice_from_file(file_path):
+    """アップロードファイルから音声クローンを設定"""
+    global REFERENCE_AUDIO, REFERENCE_TEXT, VOICE_PROMPT
+    
+    if file_path is None:
+        return gr.update(), "❌ ファイルが選択されていません"
+    
+    processed = preprocess_reference_audio(file_path)
+    REFERENCE_AUDIO = processed
+    REFERENCE_TEXT = generate_reference_text(processed)
+    VOICE_PROMPT = tts_model.model.create_voice_clone_prompt(
+        ref_audio=processed,
+        ref_text=REFERENCE_TEXT,
+        x_vector_only_mode=True,
+    )
+    
+    # プルダウン更新用の戻り値
+    updated_choices = refresh_voice_list()
+    selected_name = os.path.basename(processed)
+    return gr.update(choices=updated_choices, value=selected_name), f"✅ ファイルで設定完了: {selected_name}"
+
+def refresh_voice_list():
+    """既存音声一覧を更新"""
+    voices = list_voice_files()
+    return [f.name for f in voices]
+
+def select_existing_voice(voice_name):
+    """ドロップダウンで選択した音声を設定"""
+    global REFERENCE_AUDIO, REFERENCE_TEXT, VOICE_PROMPT
+    
+    if not voice_name:
+        return "❌ 音声が選択されていません"
+    
+    voice_path = os.path.join(VOICE_DIR, voice_name)
+    if not os.path.exists(voice_path):
+        return f"❌ ファイルが見つかりません: {voice_name}"
+    
+    #processed = preprocess_reference_audio(voice_path)
+    processed = voice_path #ファイルの再生性はしない
+    REFERENCE_AUDIO = processed
+    REFERENCE_TEXT = generate_reference_text(processed)
+    VOICE_PROMPT = tts_model.model.create_voice_clone_prompt(
+        ref_audio=processed,
+        ref_text=REFERENCE_TEXT,
+        x_vector_only_mode=True,
+    )
+    
+    return f"✅ 選択完了: {voice_name}"
+
+# ---- Gradio UI ----
+# ---- stream.ui にカスタムコンポーネントを追加 ----
+with stream.ui:
+    #gr.Markdown("## 🎤 音声クローン設定")
+    # ---- アコーディオンで全体を囲む ----
+    with gr.Accordion("🎤 音声クローン設定(最初に設定)", open=False):
+        with gr.Row():
+            mic_input = gr.Audio(
+                sources=["microphone"],
+                type="numpy",
+                label="マイクで録音（5秒）",
+                interactive=True,
+                value=None
+            )
+
+        with gr.Row():
+            voice_dropdown = gr.Dropdown(
+                choices=refresh_voice_list(),
+                label="既存の音声を選択",
+                interactive=True,
+                value=None
+            )
+            refresh_btn = gr.Button("🔄 更新")
+            select_btn = gr.Button("✅ この音声を使う")
+
+        with gr.Row():
+            file_input = gr.Audio(
+                sources=["upload"],
+                type="filepath",
+                label="音声ファイルをアップロード",
+                interactive=True,
+                value=None
+            )
+
+
+        status = gr.Textbox(
+            label="ステータス",
+            interactive=False,
+            lines=3,
+            value="🟡 待機中（WebRTC接続後、話しかけてください）"
+        )
+
+        # ---- イベント接続 ----
+        mic_input.change(
+            fn=process_voice_from_mic,
+            inputs=mic_input,
+            outputs=[voice_dropdown, status]
+        )
+        file_input.change(
+            fn=process_voice_from_file,
+            inputs=file_input,
+            outputs=[voice_dropdown, status]
+        )
+        refresh_btn.click(
+            fn=refresh_voice_list,
+            outputs=voice_dropdown
+        )
+        select_btn.click(
+            fn=select_existing_voice,
+            inputs=voice_dropdown,
+            outputs=status
+        )
+
+# ---- FastAPIアプリ作成 ----
+app = FastAPI()
+stream.mount(app)  # WebRTCエンドポイント追加
+
+# ---- FastRTCのUI（カスタムコンポーネント追加済み）を / にマウント ----
+app = gr.mount_gradio_app(app, stream.ui, path="/")
 
 # ============================================================
 # MAIN
@@ -1311,8 +1547,7 @@ http://127.0.0.1:7860
 ====================================================================
 """)
 
-    stream.ui.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-    )
+    #stream.ui.launch(server_name="0.0.0.0",server_port=7860,share=False,)
+
+    # 元の stream.ui.launch() を削除し、代わりに uvicorn で起動
+    uvicorn.run(app, host="0.0.0.0", port=7860)
